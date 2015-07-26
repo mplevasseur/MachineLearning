@@ -1,0 +1,177 @@
+---
+title: 'Class Project: Predicting Exercise Quality'
+author: 'MPL_Student: Coursera/JH/Machine Learning'
+date: "Wednesday, July 22, 2015"
+---
+*Data source: http://groupware.les.inf.puc-rio.br/har*
+
+**Executive Summary:**
+The goal is to predict the outcome variable "classe" a 5-level factor describing the manner in which fitness participants did a weight-training maneuver. The rating is of A/B/C/D/E where A is the correct method and B-E represent inferior styles. 
+
+Predictions on 40% of the data held out for testing yielded 7785/7846 right answers (61 wrong predictions) and an estimate of the error rate= 0.78%, very similar to the training set performance (0.83%). The similarity was unexpected, but the random forest model includes cross-validation as part of its development, and thus it is reasonable it produced a training set error similar to the test set. Furthermore each data point is not truly independent, as they share a link over time and guarantees some data points in a random partition will be very similar to those used in training the model. Therefore, estimated accuracy in the real world of 98.6% likely remains somewhat optimistic.
+
+**Data Loading and Cleaning**
+
+```{r, libraries, warning=FALSE, message=FALSE}
+library(doParallel);registerDoParallel(cores=2) # for parallel processing on my PC
+library(caret)
+library(ggplot2)
+library(plyr)
+```
+
+```{r, Loading, warning=FALSE, message=FALSE}
+## Working dir and download code commented out after first run to avoid repeating 
+    # WD <- getwd(); if (!is.null(WD)) setwd(WD)    
+    # URLtrain = "http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"  
+    # download.file(URL, destfile="pml-training.csv", cacheOK = TRUE)
+    # URLtest = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    # download.file(URL, destfile="pml-testing.csv", cacheOK = TRUE)
+
+# 'training0' is not the training set for analysis; from it predictors will be chosen.
+training0 <- read.csv(file="pml-training.csv", header=TRUE, sep=",")
+
+# 'submission' is not the testing partition, but rather are 20 individual test cases.
+submission <- read.csv(file="pml-testing.csv", header=TRUE, sep=",")
+```
+
+File consists of 19,622 observations in 160 columns, not all useful predictors:
+
+- Remove 67 columns with 19,216 NA obs, ~2% chance to be useful in a random test case; 
+- Remove the first 7 columns, identifiers of row, participant, and time windows,
+irrelevant for a future user at a different time, or a single data point sample from the test set;
+- Remove underpopulated columns (no data but not marked 'NA' and columns with "" as a factor level (summary statistics that will not be relevant to predict off a single point)
+
+```{r}
+# Calculate NA's by column, shows 67 variables have 19,216 NA's, 93 have 0
+    NAcount <- colSums(is.na(training0))
+    table(NAcount)      
+    keep <- NAcount<19215; summary(keep)       
+# Eliminate 67 variables
+    training1 <- training0[, keep[TRUE]]
+# Eliminate first 7 descriptor columns, underpopulated cols, and summary statistics
+    training2 <- training1[, -c(1:7, 12:20, 43:48, 52:60, 74:82)]
+# Removes kurtosis, skewness, max, min (summary stats), and amplitutde (underpopulated)
+```
+The remaining dataset has all 19,622 obs, 52 integer or continuous variables, and 
+the outcome factor variable "classe".
+
+**Partitioning**
+
+The downloaded 'training' file has sufficient observations to partition into training and test sets prior to any model building activity, in order to validate the resulting model. The submission test cases will not accomplish this since they are not random and n=20 is an insufficient sample size; and even with cross-validation built in to the random forest training function,  checking the results on data not used for training will provide some confidence. 
+
+This size dataset is "medium" meaning it will process in whole on my computer (with some patience). Therefore the simplest approach is to perform a 60/40 split for training and testing. The training set will be used to pick variables for the final model and settle on type of predciction function. The test set will be used once for prediction using the trained model.
+
+```{r}
+#Partition datafile into training and test sets (submission file used only for grading)
+set.seed(300)
+inTrain <- createDataPartition(y=training2$classe, p=0.6, list=FALSE)
+training <- training2[inTrain, ]; dim(training) #11,776 obs in training set
+testing <- training2[-inTrain, ] 
+
+# Alternative approach rejected, k-fold cross-validation
+# set.seed(300)
+# folds <- createFolds(y=training$classe, k=5, list=TRUE, returnTrain=TRUE)
+# sapply(folds, length)
+```
+ 
+**Covariate Creation and Preprocessing**
+To attempt some data compression, a correlation table below shows a list of variables correlating > 90%. The matches column serves to order the variables that correlate next to each other, but row and column identifiers identify them and are used to code removal of the columns. Ultimately 7 variables are eliminated as predictors. Based on a pairs plot (not shown) each generally has a strong linear relationship with the other.
+
+```{r, CorrTable, warning=FALSE, message=FALSE}
+#Create correlation matrix of 52 possible predictors, remove self correlations on diagonal
+M <- abs(cor(training[, -53]))
+diag(M) <- 0
+CorrTable9 <- which(M > 0.9, arr.ind=T)
+CorrTable9 <-  as.data.frame(CorrTable9)
+CorrTable9 <- name_rows(CorrTable9)
+CorrTable9 <- mutate(CorrTable9, matches= row+col)
+CorrTable9 <- arrange(CorrTable9, matches)
+# 22 variables correlate to each other >90% --> try to remove half from training set
+# The column "matches" pairs together variables that correlate for viewing
+CorrTable9
+```
+
+```{r, Pairs, warning=FALSE, message=FALSE}
+# pairs(training2[c(1,2,4,8,9,10,18,19,31,33,46)])  #not shown. Displays linearity of covariates.
+```
+
+Based on the correlation table (correlations > 90%) the following variables are dropped:
+
+- total accel belt vs. roll_belt        ...drop total accel belt (integer, prefer numeric)
+- accel belt x vs. pitch belt           ...drop accel belt x  (integer, prefer numeric)
+- accel_belt_y vs. roll_belt            ...drop accel belt y (integer, prefer numeric)  
+- accel_belt_z vs. roll_belt            ...drop accel belt z (integer, prefer numeric)
+- accel_belt_y vs. total_accel_belt     ...drop summary total accel belt, keeping component
+- accel_belt_z vs. total_accel_belt     ...drop summary total accel belt, keeping component
+- accel_belt_z vs. accel_belt_y         ...keeping both components
+- gryos_arm_y vs. gyros_arm_x           ...drop gyros_arm_y  (smaller range)
+- gyros dumbell z vs. gyros dumbell x   ...*shows outlier data point, remove ob*
+- gyros dumbbell vs. forearm            ...keep gyros forearm z, removing gyros dumbbell x and z (forearm related to user)
+
+```{r}
+# trainingsub <- filter(training, training$gyros_dumbbell_z <200) #excludes outlier
+training <- training[, -c(4,8,9,10,19,31,33)]
+dim(training)   # now have 45 variables + the outcome = 46 columns
+```
+
+**Exploratory Analysis on Training Set**
+
+The pairs plot shown below shows the nature of the variables being kept--and their strange features. It is these strange features (and noise) that beg the power of many variables, so it is not immediately obvious how to reduce it further without risking loss of information.
+
+```{r, PairPlot, warning=FALSE, message=FALSE, fig.height=5, fig.width=7}
+# One of several possible pairs plots to see strange features: segmentation, curves, tails, 
+# offshoots, dips, loops, zig-zags, outliers
+pairs(training[39:45])  
+```
+
+The boxplot below helps get a sense of the type of variables that are important and how they interact with the outcome, using the features pitch and total acceleration of the dumbbell. Comparing the correct version of the exercise (A) with the others, the correct exercise has the fullest range in pitch, accelerates the least, and limits acceleration primarily at the negative extent (bottom?). 
+
+Conversely:
+
+- B displays more acceleration at the top and favors pitch at the top; 
+- C has a narrow range of pitch; 
+- D rarely affords a pitch = zero (the dumbbell is not often square); 
+- Both D and E tend to have acceleration throughout with a narrow range of pitch. 
+
+```{r, Box, warning=FALSE, message=FALSE}
+qplot(classe, pitch_dumbbell, data=training, colour=total_accel_dumbbell, geom=c("boxplot", "jitter"))
+```
+
+**Training the Model**
+
+Random Forest modeling is used on 45 variables, and took ~ 2.5 hours to train with 4 threads (cores) runnning in parallel.
+
+```{r, RandomForest, warning=FALSE, message=FALSE}
+# The trained model was cached (saved to computer) and recalled for use. Code:
+    # modFit <- train(training$classe~ ., data=training, method="rf", prox=TRUE)
+    # saveRDS(modFit, file="modFitRF1.rds")
+  
+# Reading the trained model back in for knitr execution:
+    modFit = readRDS("modFitRF1.rds")
+    modFit
+    modFit$ finalModel$ confusion
+```
+
+The accuracy of the model chosen by caret's train() function is 98.6%, and as expected the training sample accuracy is even better; the training sample the out-of-bag error rate is 0.83%. The table above shows the model is trained to 11,678 consistent predictions with results and 98 errors.
+
+**Testing and Cross-Validation**
+
+The output on the test set below shows the model produced 7785 right answers out of 7846 (61 wrong). The estimate of the error rate is 0.78%--similar to the training set performance (0.83%). One reason the test set was simliar to, even slightly better than, the training set could be that many of the data points are not truly independent, they share a time component that makes a given data point similar to those around it, and these are randomly divided into test and training sets therefore to some degree will be similar. 
+
+This fact does not necessarily negate its usefulness, however, just possibly over-estimates real world accuracy as applied to completely different subjects. Since those subjects would perform the same maneuver in presumably the same manners, the model would likely still be useful.
+
+The stacked bar-plot below shows the overall occurrence of each outcome (A the most, otherwise evenly spread) and that when the model has trouble, it tends to be be with case B, C, and D (D has the highest in-class error). 
+
+```{r, Predict, warning=FALSE, message=FALSE}
+# Use the model to produce predictions on the 20 test cases:
+testanswers <- predict(modFit, submission)  # testanswers not printed here
+
+# Use the model on the testing set
+pred <- predict(modFit, testing); 
+# Calculate the right / wrong predictions, make table and plot
+testing$predRight <- pred==testing$classe
+table(pred, testing$classe)
+qplot(classe, fill=predRight, main="Testing Set Outcomes", data=testing)
+```
+
+In summary, this model was 20/20 on the test cases and took ~ 2.5 hours to train. This may be suitable for the purpose, but its stated accuracy may not fully translate to a single data point of a different user at a different time.
