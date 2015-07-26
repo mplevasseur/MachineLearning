@@ -174,4 +174,12 @@ table(pred, testing$classe)
 qplot(classe, fill=predRight, main="Testing Set Outcomes", data=testing)
 ```
 
+**Relative Importance of the Predictors**
+
+This table shows how the final model prioritizes the predictors. With the good resulting accuracy of the random forest model, it may now be possible to compress the data further by removing the least important factors and create a model easier on processing time.
+
+```{r}
+varImp(modFit)
+```
+
 In summary, this model was 20/20 on the test cases and took ~ 2.5 hours to train. This may be suitable for the purpose, but its stated accuracy may not fully translate to a single data point of a different user at a different time.
